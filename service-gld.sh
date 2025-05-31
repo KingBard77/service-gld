@@ -4,7 +4,7 @@
 NC='\033[0m'
 SUCCESS='\033[0;32m'
 ERROR='\033[0;31m'
-WARNING='\033[0;33m'
+WARN='\033[0;33m'
 INFO='\033[0;34m'
 
 MENU="
