@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Set colors for script output
+# COLORS
 NC='\033[0m'
 SUCCESS='\033[0;32m'
 ERROR='\033[0;31m'
 WARN='\033[0;33m'
-INFO='\033[0;34m'
+INFO='\033[1;34m'
 
 MENU="
 ######################################################################
@@ -18,8 +18,26 @@ MENU="
 #######################################################################
 "
 
-# Source the configuration file
-source conf/setup.conf
+# FALSE = run inside VM, TRUE = run remotely via xxclustersh
+IS_REMOTE=TRUE
+
+# SOURCE SCRIPT DIRECTORY
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && "${BASH_SOURCE[0]}" != "-bash" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+else
+    SCRIPT_DIR="$(pwd)"
+fi
+
+# SOURCE SETUP.CONF
+if [[ "$IS_REMOTE" == FALSE ]]; then
+    CONFIG_FILE="${SCRIPT_DIR}/conf/setup.conf"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${ERROR}  ERROR: Missing configuration file: $CONFIG_FILE${NC}"
+        exit 1
+    fi
+fi
 
 echo -e "${INFO}##### Package: Update ${NC}"
 apt --assume-yes --quiet update
@@ -92,24 +110,85 @@ nfs_remove(){
     echo -e "${SUCCESS}##### NFS: Removal complete ${NC}"
 }
 
-# Log Server
-log_install(){
-    echo -e "${INFO}##### Install: Log Client ${NC}"
+# Log Server (Logstash + Filebeat on same VM; Logstash -> ES over TLS)
+log_install() {
+  echo -e "${INFO}##### Install: Log Client ${NC}"
 
-    wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor --yes -o /usr/share/keyrings/elastic.gpg
-    echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/${ES_VERSION}/apt stable main" > /etc/apt/sources.list.d/elastic-${ES_VERSION}.list
-    apt update
-    apt --assume-yes install logstash apt-transport-https
-    mkdir -p /etc/elasticsearch/ca
-    echo "$ES_CERT" > /etc/elasticsearch/ca/ca.crt
-    echo "$LOG_CONF_CONTENT" > /etc/logstash/conf.d/logstash.conf
-    systemctl daemon-reload
-    systemctl restart logstash.service
-    systemctl enable logstash.service
-    curl -u $ES_USERNAME:$ES_PASSWORD -X GET "https://${ES_SERVER_HOST}:${ES_SERVER_PORT}/_cluster/health?pretty" --cacert /etc/elasticsearch/ca/ca.crt
+  # 0) Ensure system CA store is fresh (for Elastic APT TLS)
+  apt -y install --reinstall ca-certificates >/dev/null 2>&1 || true
+  update-ca-certificates >/dev/null 2>&1 || true
 
-    echo -e "${SUCCESS}##### Log: Install complete ${NC}"
+  # 1) Elastic APT repo + Logstash
+  wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch \
+    | gpg --dearmor --yes -o /usr/share/keyrings/elastic.gpg
+  echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/${ES_VERSION}/apt stable main" \
+    > /etc/apt/sources.list.d/elastic-${ES_VERSION}.list
+  apt update
+  apt -y install apt-transport-https logstash
+
+  # 2) CA that Logstash (and curl) can read
+  CA_PATH="/etc/logstash/certs/http_ca.crt"     # <— hard set (not :=)
+  mkdir -p "$(dirname "$CA_PATH")"
+
+  if [[ -r /etc/elasticsearch/certs/http_ca.crt ]]; then
+    echo -e "${INFO}##### Copying ES CA to ${CA_PATH} ${NC}"
+    install -m 0644 /etc/elasticsearch/certs/http_ca.crt "$CA_PATH"
+  else
+    echo -e "${INFO}##### CA: Fetching from https://${ES_SERVER_HOST}:${ES_SERVER_PORT} ${NC}"
+    curl -ks "https://${ES_SERVER_HOST}:${ES_SERVER_PORT}" \
+      | grep -oP '(?s)-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----' \
+      > "$CA_PATH" || true
+  fi
+
+  if [[ ! -s "$CA_PATH" ]]; then
+    echo -e "${ERROR}Failed to obtain Elasticsearch CA at ${CA_PATH}.${NC}"
+    exit 1
+  fi
+  chmod 0644 "$CA_PATH"
+
+  if [[ ! -s "$CA_PATH" ]]; then
+    echo -e "${ERROR}Failed to obtain Elasticsearch CA at ${CA_PATH}.${NC}"
+    exit 1
+  fi
+  chmod 0644 "$CA_PATH"
+
+  echo -e "${INFO}##### Logstash: Writing pipeline ${NC}"
+  printf "%s\n" "$LS_INPUT_CONF"  >/etc/logstash/conf.d/00-input-beats.conf
+  printf "%s\n" "$LS_FILTER_CONF" >/etc/logstash/conf.d/10-filter.conf
+  printf "%s\n" "$LS_OUTPUT_CONF" >/etc/logstash/conf.d/99-output-es.conf
+
+  if [[ "${LS_AUTORELOAD:-false}" == "true" || "${LS_AUTORELOAD:-false}" == "TRUE" ]]; then
+    sed -ri 's/^#?\s*config.reload.automatic:.*/config.reload.automatic: true/' /etc/logstash/logstash.yml
+    grep -q '^config.reload.interval:' /etc/logstash/logstash.yml || echo 'config.reload.interval: 3s' >> /etc/logstash/logstash.yml
+  fi
+
+  systemctl daemon-reload
+  systemctl enable logstash
+  systemctl restart logstash
+
+  # 4) Filebeat (ships syslog/auth to Logstash 5044)
+  echo -e "${INFO}##### Install: Filebeat ${NC}"
+  apt update
+  apt -y install filebeat
+
+  # Minimal config: ship syslog & auth.log to local Logstash
+  printf "%s\n" "$FB_YML" >/etc/filebeat/filebeat.yml
+  systemctl enable --now filebeat
+
+  # Enable system module for nicer parsing (optional but useful)
+  filebeat modules enable system >/dev/null 2>&1 || true
+
+  systemctl enable --now filebeat
+
+  # 5) Verify ES connectivity via readable CA
+  echo -e "${INFO}##### Verify: ES health via CA ${NC}"
+  curl -s -u "$ES_USERNAME:$ES_PASSWORD" \
+    --cacert "$CA_PATH" \
+    "https://${ES_SERVER_HOST}:${ES_SERVER_PORT}/_cluster/health?pretty" || true
+
+  echo -e "${SUCCESS}##### Log: Install complete ${NC}"
 }
+
 
 # Mail Relay Client
 mil_install(){
